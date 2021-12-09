@@ -1,0 +1,41 @@
+RPMBUILD = /tmp/rpmbuild
+INSTALLPREFIX = /opt/bsa
+
+# nothing to build
+all:
+        @echo "Nothing to do. Maybe you want to run '$(MAKE) rpm'?"
+
+clean:
+        rm -f rpm mspha-*.rpm
+        rm -rf mspha-*
+
+install: all
+        install -d $(INSTALLPREFIX)/bin $(INSTALLPREFIX)/lib/mspha
+        install -m 0755 mspfwd.py $(INSTALLPREFIX)/bin
+        install -m 0755 mspfile.py $(INSTALLPREFIX)/bin
+        install -m 0755 mspzone.py $(INSTALLPREFIX)/bin
+        install -m 0755 mspexceptions.py $(INSTALLPREFIX)/bin
+        install -m 0755 string_helpers.py $(INSTALLPREFIX)/bin
+        install -m 0755 mspfwd_stats.py $(INSTALLPREFIX)/bin
+        install -m 0755 mspfwd_retransmit.py $(INSTALLPREFIX)/bin
+        install -m 0755 auditfwd.py $(INSTALLPREFIX)/bin
+        install -m 0755 auditmasterfwd.py $(INSTALLPREFIX)/bin
+        install -m 0755 sshparamiko.py $(INSTALLPREFIX)/bin
+        install -m 0755 adt-loop.py $(INSTALLPREFIX)/bin
+        install -m 0755 mspha_conf.sh $(INSTALLPREFIX)/bin
+        install -m 0755 mspfwd_loadconf.sh $(INSTALLPREFIX)/bin
+        install -m 0755 mspfwd_conf_sample.sh $(INSTALLPREFIX)/bin
+        install -m 0644 default.yaml $(INSTALLPREFIX)/lib/mspha
+        install -m 0644 mspfwd_prom_stats.py $(INSTALLPREFIX)/lib/mspha
+
+test:
+        ./pipe_test.py
+
+rpm: mspfwd.py mspfile.py mspzone.py mspexceptions.py string_helpers.py mspfwd_stats.py mspha_conf.sh default.yaml mspha.spec
+        rm -rf $(RPMBUILD)
+        mkdir -p $(RPMBUILD)/BUILDROOT
+        ln -s $$PWD $(RPMBUILD)/BUILD
+        rpmbuild --define "_topdir $(RPMBUILD)" --define "_installprefix $(INSTALLPREFIX)" -bb mspha.spec
+        cp -p $(RPMBUILD)/RPMS/noarch/mspha*.rpm .
+        rm -rf $(RPMBUILD)
+        touch $(@)
