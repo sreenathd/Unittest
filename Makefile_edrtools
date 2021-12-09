@@ -1,0 +1,254 @@
+SHELL = /bin/bash
+# PB_INST is where we install our local google protobuf
+PB_INST = protobuf_install
+# resolve CXX and LD flags to compile and link our src with PB_INST lib
+PB_LDFLAGS = `PKG_CONFIG_PATH=$(PB_INST)/lib/pkgconfig pkg-config --libs protobuf`
+PB_CXXFLAGS = `PKG_CONFIG_PATH=$(PB_INST)/lib/pkgconfig pkg-config --cflags protobuf`
+# uncomment and change address sanitizer options below if necessary
+# perform `make scrub` between commenting/uncommenting sanitization
+# below options are good for Apple Xcode 11
+#CXXFLAGS_SANITIZE = -fsanitize=address -fsanitize=undefined 
+#LDFLAGS_SANITIZE = -fsanitize=address -fsanitize=undefined
+# below options are good for g++ 4.8 on CentOS7 - don't forget to `sudo yum install libasan`
+#CXXFLAGS_SANITIZE = -fsanitize=address
+#LDFLAGS_SANITIZE = -fsanitize=address
+CXXFLAGS += -D__STDC_FORMAT_MACROS -std=c++11 -Wall -g -O2 $(PB_CXXFLAGS) $(CXXFLAGS_SANITIZE)
+LDFLAGS += $(PB_LDFLAGS) $(LDFLAGS_SANITIZE)
+LINK.o = $(LINK.cc)
+
+CXXBINS = json2edr edr2json edrcnt edr2txt edrsel edrfxprn edrs2bundle
+# installable binaries
+BINS = json2edr edr2json edrcnt edr2txt edrsel edr_bad_record.sh
+
+RPMBUILD = /tmp/rpmbuild
+INSTALLPREFIX = /opt/bsa
+
+include fields.inc
+
+all: $(CXXBINS)
+
+#
+# compile embedded protobuf google lib and install it under PB_INST
+#
+protobuf_compile:
+	cd protobuf && git checkout 3.8.x && ./autogen.sh
+	mkdir -p $(PB_INST)
+	cd protobuf && CXXFLAGS="$(CXXFLAGS_SANITIZE)" LDFLAGS="$(LDFLAGS_SANITIZE)" ./configure --prefix=$$PWD/../$(PB_INST) --disable-shared --enable-static
+	cd protobuf && $(MAKE)
+	cd protobuf && $(MAKE) install
+	touch $(@)
+
+#
+# list of proto definitions with derived c++ and python modules for them
+#
+PB_MOD = $(wildcard defs/*.proto)
+
+PY_MOD = $(subst defs/,, $(PB_MOD:.proto=_pb2.py))
+
+CC_MOD = $(subst defs/,, $(PB_MOD:.proto=.pb.cc))
+
+H_MOD = $(subst defs/,, $(PB_MOD:.proto=.pb.h))
+
+O_MOD = $(subst defs/,, $(PB_MOD:.proto=.pb.o))
+
+# they all depend on main protobuf lib
+$(H_MOD) $(O_MOD) $(PY_MOD): protobuf_compile
+
+# automatic rules to compile proto definitions into C and Python
+.SUFFIXES: .proto _pb2.py .pb.cc .pb.h
+.PRECIOUS: $(CC_MOD) $(H_MOD)
+
+%_pb2.py: defs/%.proto 
+	./$(PB_INST)/bin/protoc --proto_path=defs --python_out=. $(<)
+
+%.pb.h: defs/%.proto
+	./$(PB_INST)/bin/protoc --proto_path=defs --cpp_out=. $(<)
+
+# bogus target to make sure all proto files compiled first
+%.pb.cc: %.pb.h $(H_MOD)
+	@true
+
+# custom linker rule
+$(CXXBINS):
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+edr_dict.cc: parse_edr.py $(PY_MOD)
+	PYTHONPATH=./protobuf/python ./parse_edr.py >$(@).new
+	mv $(@).new $(@)
+
+libedr.a: $(O_MOD) edr_dict.o
+	ar -r $(@) $(O_MOD) edr_dict.o
+
+die.h: protobuf_compile
+
+die.o: die.cc die.h
+
+json2edr.o: $(H_MOD) die.h
+
+json2edr: json2edr.o die.o libedr.a
+
+edr2json.o: $(H_MOD) die.h
+
+edr2json: edr2json.o die.o libedr.a
+
+edrcnt.o: die.h varint.h
+
+edrcnt: edrcnt.o die.o varint.o
+
+edr2txt.o: $(H_MOD) die.h varint.h
+
+edr2txt: edr2txt.o die.o varint.o libedr.a
+
+edrs2bundle.o: die.h varint.h
+
+edrs2bundle: edrs2bundle.o die.o varint.o
+
+edrsel.o: die.h varint.h
+
+edrsel: edrsel.o die.o varint.o
+
+edrfxprn.o: $(H_MOD) die.h
+
+edrfxprn: edrfxprn.o die.o libedr.a
+
+install: $(BINS)
+	install -d $(INSTALLPREFIX)/bin
+	for b in $(BINS); do install -m 0755 $$b $(INSTALLPREFIX)/bin; done
+
+rpm: $(BINS) edrtools.spec
+	rm -rf $(RPMBUILD)
+	mkdir -p $(RPMBUILD)/BUILDROOT
+	ln -s $$PWD $(RPMBUILD)/BUILD
+	rpmbuild --define "_topdir $(RPMBUILD)" --define "_installprefix $(INSTALLPREFIX)" -bb edrtools.spec
+	cp -p $(RPMBUILD)/RPMS/x86_64/edrtools*.rpm .
+	rm -rf $(RPMBUILD)
+	touch $(@)
+
+test: basic_test2 basic_test1_json basic_test1_tab_csv basic_test1_csv basic_test1__csv basic_test2 basic_test2_csv basic_test2__csv basic_test3_csv test_88_fields test_non_printable bigger_json_test bigger_json_dbg_test edr2txt_test bundle_test unbundle_test bad_test edrcnt_test edrsel_test edr_bad_record_test bad_skip_test bench_test
+
+basic_test1: edr2txt
+	@echo "Test1..."
+	./edr2txt NR timestamp.timeusecs timestamp.iso recordType.str str <data/basic1.pb
+	@echo "OK"
+
+basic_test1_json: edr2txt
+	@echo "basic_test1_json..."
+	@./edr2json <data/basic1.pb | diff - data/basic1.json
+	@echo "OK"
+
+basic_test1_tab_csv: edr2txt
+	@echo "basic_test1_tab_csv..."
+	@./edr2txt -t $$'\t' $(FIELDS) < data/basic1.pb | diff - data/basic1_tab.csv
+	@echo "OK"
+
+basic_test1_csv: edr2txt
+	@echo "basic_test1_csv..."
+	@./edr2txt -t, $(FIELDS) < data/basic1.pb | diff - data/basic1.csv
+	@echo "OK"
+
+basic_test1__csv: edr2txt
+	@echo "basic_test1__csv..."
+	@./edr2txt -t_ $(FIELDS) < data/basic1.pb | diff - data/basic1_.csv
+	@echo "OK"
+
+basic_test2: edr2json json2edr
+	@echo "Test2..."
+	./edr2json <data/basic2.pb | diff - data/basic2.json
+	@echo "OK"
+
+basic_test2_csv: edr2txt
+	@echo "basic_test2_csv..."
+	@./edr2txt -t, $(FIELDS) < data/basic2.pb | diff - data/basic2.csv
+	@echo "OK"
+
+basic_test2__csv: edr2txt
+	@echo "basic_test2__csv..."
+	@./edr2txt -t_ $(FIELDS) < data/basic2.pb | diff - data/basic2_.csv
+	@echo "OK"
+
+basic_test3_csv: edr2txt
+	@echo "basic_test3_csv..."
+	@./edr2txt -t, $(FIELDS) < data/basic3.pb | diff - data/basic3.csv
+	@echo "OK"
+
+test_88_fields: json2edr edr2txt
+	@echo "Test 88 fields..."
+	./test88_fields.sh data/field88_in_out.data data/field88.json 
+	@echo "OK"
+
+test_non_printable: json2edr edr2txt
+	@echo "Test non-printable characters..."
+	./json2edr <data/edr_non_print.json | ./edr2txt httpRecord.httpTransactionRecord.requestInformation.refererUrl | diff - data/edr_non_print.txt
+	@echo "OK"
+
+bigger_json_test: edr2json
+	@echo "Bigger edr2json test..."
+	./edr2json <data/bigger_proto.pb | diff - data/bigger_proto.json
+	@echo "OK"
+
+bigger_json_dbg_test: edr2json
+	@echo "Bigger edr2json debug test..."
+	./edr2json -d <data/bigger_proto.pb | diff - data/bigger_proto.dbg
+	@echo "OK"
+
+edr2txt_test: edr2txt
+	@echo "edr2txt test..."
+	./test_edr2txt.sh data/bigger_proto.pb data/bigger_proto.out
+	@echo "OK"
+
+bench_test: edrcnt edrfxprn edr2txt test_bench.sh
+	@echo "Benchmark test..."
+	./test_bench.sh data/bigger_proto.pb 5000
+	@echo "OK"
+
+bundle_test: edrs2bundle parse_bundle_test.py
+	@echo "Running edrs2bundle + parsering it in python..."
+	./edrs2bundle <data/basic2.pb | PYTHONPATH=./protobuf/python ./parse_bundle_test.py
+	@echo "OK"
+
+unbundle_test: edrs2bundle
+	@echo "Running bundle/unbundle test..."
+	./edrs2bundle <data/basic2.pb | ./edrs2bundle -u | diff -q data/basic2.pb -
+	@echo "OK"
+
+bad_test: edr2txt
+	@echo "Testing corrupt files parsing..."
+	./test_bad.sh
+
+edrcnt_test: edrcnt
+	@echo "Testing edrcnt..." # 100*basic2.pb will have 500 records
+	@yes data/basic2.pb | head -100 | xargs cat | ./edrcnt | diff <(echo 500) -
+	@echo "OK"
+
+edrsel_test: edrsel
+	@echo "Testing edrsel..." # taking records 101..105 from 100*basic2.pb stream gives back basic2.pb
+	@yes data/basic2.pb | head -100 | xargs cat | ./edrsel 101-105 | diff data/basic2.pb -
+	@echo "OK"
+
+edr_bad_record_test: edr2txt edrsel edrcnt
+	@echo "Testing edr_bad_record.sh..."
+	./edr_bad_record.sh data/bad_6th_rec.pb.gz | diff data/bad_rec.pb -
+	@echo "OK"
+
+bad_skip_test: edr2txt
+	@echo "Skipping 3 bad records when input has 3 should be fine..."
+	@for ((i=0; i<3; i++)); do cat data/basic2.pb; cat data/bad_rec.pb; done | ./edr2txt -n 3 $(FIELDS) >/dev/null 2>&1
+	@echo "Skipping only 2 bad records when input has 3 must cause an error..."
+	@for ((i=0; i<3; i++)); do cat data/basic2.pb; cat data/bad_rec.pb; done | (! ./edr2txt -n 2 $(FIELDS) >/dev/null 2>&1)
+	@echo "OK"
+
+clean:
+	rm -f *.pyc *.o
+	rm -f $(PY_MOD)
+	rm -f $(H_MOD)
+	rm -f $(CC_MOD)
+	rm -f libedr.a
+	rm -f edr_dict.cc
+	rm -f $(CXXBINS)
+	cd protobuf && $(MAKE) clean
+
+# clean protobuf lib too
+scrub: clean
+	rm -f protobuf_compile
+	rm -rf $(PB_INST)
+	cd protobuf && $(MAKE) distclean
