@@ -1,0 +1,9 @@
+input:
+  - host: mspfwd1-mtlab
+    string: "Zookeeper connection established"
+  - host: mspfwd1-mtlab
+    string: "Zookeeper connection established"
+email:
+  - sk3798@att.com
+  - sk3798@att.com
+
