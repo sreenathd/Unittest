@@ -66,7 +66,7 @@ class serverlogCollect:
         self.runcommand = runServerCmd(self.host)
         self.result = {}
         global Email
-        Email = self.email
+        Email = ",".join(self.email)
         
     def run(self):
         try:
@@ -99,8 +99,8 @@ if __name__ == "__main__":
             data = yaml.safe_load(stream)
             print(data)
             for item in data:
+                if 'email' in item: break
                 for i in data[item]:
-                    print(i)
                     slc = serverlogCollect(i['host'], i['string'], i['email'], args['logfilepath'], args['yamlfile'])
                     slc.run()
         except yaml.YAMLError as exc:
