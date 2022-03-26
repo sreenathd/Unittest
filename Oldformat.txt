@@ -1,0 +1,386 @@
+#!/usr/bin/env python
+import os, sys, json, time, os.path
+import re, argparse, smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from datetime import datetime
+import pytz
+
+def valid_version(version):
+    if version[0] == 'V':
+       return True
+    return False
+
+def format_text(alert, text):
+    if not alert['tag'].startswith('mspfwd.py'):
+        return text
+    substr_list = ['#012BsaSftpException:', '#012BsaExitCodeException:']
+    for substr in substr_list:
+        if substr in text:
+            index = text.index(substr)
+            return text[index:]
+    return text
+
+def parse_line(config, line, period_start, period_end):
+    errline = line.rstrip()
+    ndx = 0
+    alert = {}
+    try:
+        tokens = errline.split('|')
+        if len(tokens) < 5:
+            return
+        # timegenerated
+        timestr = tokens[ndx]
+        msgtime = datetime.strptime(timestr, '%Y-%m-%d %H:%M:%S')
+        utime = time.mktime(msgtime.timetuple())
+        if utime < period_start or utime >= period_end:
+            return
+        alert['utime'] = utime
+
+        # Optional version
+        version = ''
+        if valid_version(tokens[1]):
+            version = tokens[1]
+            ndx = 1
+
+        # syslogseverity
+        ndx += 1
+        level = tokens[ndx]
+        if level not in config['alertlevels']:
+            return
+        alert['level'] = level
+
+        # HOSTNAME - remove .prod.bsa.research.att.com
+        ndx += 1
+        fqdn = tokens[ndx]
+        if '.prod.bsa.research.att.com' in fqdn:
+            host = fqdn.replace('.prod.bsa.research.att.com', '')
+        else:
+            host = fqdn
+        alert['host'] = host
+
+        # syslogtag
+        ndx += 1
+        tag = tokens[ndx]
+        # remove ':'
+        if tag.endswith(':'):
+            tag = tag[:-1]
+        alert['tag'] = tag
+
+        # msg text
+        text_unstripped = ''
+        while ndx < (len(tokens) - 1):
+            ndx += 1
+            text_unstripped += tokens[ndx]
+        text = text_unstripped.strip()
+        if text.startswith('libvirt plugin: Unable to connect:'):
+            return
+        alert['text'] = format_text(alert, text)
+        return alert
+
+    except Exception, e:
+        sys.stderr.write(str(e) + '\n\n')
+        return
+
+
+def cmptext(alert1, alert2):
+    if alert1['text'] == alert2['text']:
+        return True
+    return False
+
+def gen_alertlist(config, period_start, period_end, prev_alertlist):
+    alertlist = {}
+    for alertkey in prev_alertlist:
+        for entry in prev_alertlist[alertkey]:
+            if entry['status'] == 'ENDED':
+                continue
+            entry['status'] == 'CONT'
+            if not alertkey in alertlist:
+                alertlist[alertkey] = []
+            entry['count'] = 0
+            alertlist[alertkey].append(entry)
+    
+    for input_filename in config['input_filenames']:
+        if not os.path.exists(input_filename): continue
+        with open(input_filename) as f:
+            for line in f:
+                alert = parse_line(config, line, period_start, period_end)
+                if alert is not None:
+                    add_to_alertlist(alert, alertlist)
+
+    # Now mark the 'ended' alerts
+    for alertkey in alertlist:
+        for index in range(len(alertlist[alertkey])):
+            if alertlist[alertkey][index]['last_reported'] < period_start:
+                alertlist[alertkey][index]['status'] = 'ENDED'
+    return alertlist
+
+def make_alertkey(alert):
+    return(alert['host'] + alert['level'] + alert['tag'])
+
+def add_to_alertlist(alert, alertlist):
+    alertkey = make_alertkey(alert)
+    if alertkey in alertlist:
+        for index in range(len(alertlist[alertkey])):
+            if cmptext(alertlist[alertkey][index], alert):
+               alertlist[alertkey][index]['status'] = 'CONT'
+               if alert['utime'] < alertlist[alertkey][index]['first_reported']:
+                   alertlist[alertkey][index]['first_reported'] = alert['utime']
+               if alert['utime'] > alertlist[alertkey][index]['last_reported']:
+                   alertlist[alertkey][index]['last_reported'] = alert['utime']
+               alertlist[alertkey][index]['count'] += 1
+               return
+    alert['first_reported'] = alert['utime']
+    alert['last_reported'] = alert['utime']
+    alert['status'] = 'NEW'
+    alert['count'] = 1
+    if not alertkey in alertlist:
+        alertlist[alertkey] = []
+    alertlist[alertkey].append(alert)
+
+def getloc(config):
+    with open(config['properties_fname']) as propertyfile:
+        for line in propertyfile:
+            line = line.strip()
+            if line.startswith('location.name'):
+                tag, loc = line.split('=')
+                return(loc)
+
+
+def main(cfgpath):
+    with open(cfgpath) as cfgfile:
+        config = json.load(cfgfile)
+
+    loc = getloc(config)
+
+    old_alertstatus = {
+        'period_start': 0, 'period_end': 0, 'alertlist': {} }
+
+    try:
+        if os.path.exists(config['status_fname']):
+            with open(config['status_fname']) as inpfile:
+                old_alertstatus = json.load(inpfile)
+    except Exception, e:
+        sys.stderr.write(str(e) + '\n\n')
+
+    # update all_alerts from input files
+    period_duration = config['period_duration']
+    period_end = time.time()
+    period_start = time.time() - period_duration
+
+    alertlist = gen_alertlist(
+        config, period_start, period_end, old_alertstatus['alertlist'])
+
+    new_count = 0
+    cont_count = 0
+    ended_count = 0
+    for alertkey in alertlist:
+        for alert in alertlist[alertkey]:
+            if alert['status'] == 'NEW':
+                new_count += 1
+            if alert['status'] == 'CONT':
+                cont_count += 1
+            if alert['status'] == 'ENDED':
+                ended_count += 1
+    if new_count + cont_count + ended_count == 0:
+        return
+    if new_count == 0: 
+        if period_end < (old_alertstatus['period_end'] + period_duration):
+            return
+	
+    send_email(loc, config, period_start, period_end, alertlist)
+
+    alertstatus = {}
+    alertstatus['period_start'] = period_start
+    alertstatus['period_end'] = period_end
+    alertstatus['alertlist'] = alertlist
+    with open(config['status_fname'], 'w') as outfile:
+        json.dump(alertstatus, outfile, indent=2)
+
+class HtmlFormatter(object):
+    def __init__(self):
+        self.data = [ ]
+        self.start = '''\
+<html xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns:m="http://schemas.microsoft.com/office/2004/12/omml" xmlns="http://www.w3.org/TR/REC-html40"><head><META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=us-ascii"><meta name=Generator content="Microsoft Word 14 (filtered medium)"><style><!--
+/* Font Definitions */
+@font-face
+        {font-family:Calibri;
+        panose-1:2 15 5 2 2 2 4 3 2 4;}
+@font-face
+        {font-family:Consolas;
+        panose-1:2 11 6 9 2 2 4 3 2 4;}
+/* Style Definitions */
+p.MsoNormal, li.MsoNormal, div.MsoNormal
+        {margin:0in;
+        margin-bottom:.0001pt;
+        font-size:11.0pt;
+        font-family:"Calibri","sans-serif";}
+a:link, span.MsoHyperlink
+        {mso-style-priority:99;
+        color:blue;
+        text-decoration:underline;}
+a:visited, span.MsoHyperlinkFollowed
+        {mso-style-priority:99;
+        color:purple;
+        text-decoration:underline;}
+p.MsoPlainText, li.MsoPlainText, div.MsoPlainText
+        {mso-style-priority:99;
+        mso-style-link:"Plain Text Char";
+        margin:0in;
+        margin-bottom:.0001pt;
+        font-size:11.0pt;
+        font-family:"Calibri","sans-serif";}
+span.PlainTextChar
+        {mso-style-name:"Plain Text Char";
+        mso-style-priority:99;
+        mso-style-link:"Plain Text";
+        font-family:"Calibri","sans-serif";}
+.MsoChpDefault
+        {mso-style-type:export-only;
+        font-family:"Calibri","sans-serif";}
+@page WordSection1
+        {size:8.5in 11.0in;
+        margin:1.0in 1.0in 1.0in 1.0in;}
+div.WordSection1
+        {page:WordSection1;}
+--></style><!--[if gte mso 9]><xml>
+<o:shapedefaults v:ext="edit" spidmax="1026" />
+</xml><![endif]--><!--[if gte mso 9]><xml>
+<o:shapelayout v:ext="edit">
+<o:idmap v:ext="edit" data="1" />
+</o:shapelayout></xml><![endif]--></head>
+<body lang=EN-US link=blue vlink=purple><div class=WordSection1>
+'''
+        self.replacements = [
+            ( re.compile(r'\*\*\*(.*?)\*\*\*'),
+              r'''<b><span style='color:blue'>\1</span></b>''' ),
+            ( re.compile(r'\*\*(.*?)\*\*'),
+              r'''<b><span style='color:red'>\1</span></b>''' ),
+            ( re.compile(r'\*(.*?)\*'),
+              r'''<b>\1</b>''' ),
+            ( re.compile(r'<p>'),
+              r'''<p class=MsoPlainText>'''),
+            ( re.compile(r'</p>'),
+              r'''<o:p></o:p></p>''')
+            ]
+        self.end = '</div></body></html>\n'
+    def __str__(self):
+        return ''.join([self.start]+self.data+[self.end])
+    def write(self, datum):
+        for pattern, repl in self.replacements:
+            datum = pattern.sub(repl, datum)
+        self.data.append(datum)
+    def write_line(self, line=''):
+        self.write('<p>%s</p>\n' % line)
+    def start_dl(self):
+        'start Definition List'
+        self.write('<DL>\n')
+    def write_udl(self, text):
+        'write un-indented Definition List line'
+        self.write('<DT>%s\n' % text)
+    def write_idl(self, text):
+        'write indented Definition List line'
+        self.write('<DD>%s\n' % text)
+    def end_dl(self):
+        'end Definition List'
+        self.write('</DL>\n')
+
+
+def gen_all_summary(f, alertlist):
+    new = 0
+    cont = 0
+    ended = 0
+    for alertkey in alertlist:
+        for entry in alertlist[alertkey]:
+            if entry['status'] == 'NEW':
+                new += 1
+            if entry['status'] == 'CONT':
+                cont += 1
+            if entry['status'] == 'ENDED':
+                ended += 1
+
+    s = []
+    s.append( '**%d new**' % new )
+    s.append( '**%d ended**' % ended)
+    s.append( '**%d continuing**' % cont)
+    f.write_line( 'Production Alert Status: %s' % ( ', '.join(s)))
+
+
+def add_errors(f, type, alertlist):
+    max_text_len = 68
+    heading = '**Ended Alerts**'
+    if type == 'NEW':
+        heading = '**New Alerts**'
+    if type == 'CONT':
+        heading = '**Continuing Alerts**'
+
+    total_count = 0
+    for alertkey in alertlist:
+        count = 0
+        for alert in alertlist[alertkey]:
+            if alert['status'] == type:
+                if total_count == 0:
+                    f.write_line()
+                    f.write_line(heading)
+                    total_count += 1
+
+                if count == 0:
+                    f.start_dl()
+                    f.write_udl(alert['host'] + '/' + alert['tag'])
+                    count += 1
+                text = alert['text']
+                if len(text) > max_text_len:
+                    text = text[:max_text_len-3] + '...'
+                local_tz =  pytz.timezone('America/New_York')
+                dt = datetime.fromtimestamp(alert['first_reported'], local_tz)
+                first_reported = dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+                dt = datetime.fromtimestamp(alert['last_reported'], local_tz)
+                last_reported = dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+
+                f.write_idl('***%s*** - *%s*' % (alert['level'].upper(), text))
+                f.write_idl('Encountered in this period: %d' % (alert['count']))
+                f.write_idl('First Reported: %s' % (first_reported))
+                f.write_idl('Last Reported: %s' % (last_reported))
+            if count > 0:
+                f.end_dl()
+
+
+def send_email(loc, config, period_start, period_end, alertlist):
+    subject_line = config['subject_line'].format(loc.upper())
+    sender = config['sender']
+    receivers = config['receivers']
+    if isinstance(receivers, list):
+        receivers = ', '.join(receivers)
+
+    body = HtmlFormatter()
+    gen_all_summary(body, alertlist)
+
+    local_tz =  pytz.timezone('America/New_York')
+    dt = datetime.fromtimestamp(period_start, local_tz)
+    period_start_text = dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+    dt = datetime.fromtimestamp(period_end, local_tz)
+    period_end_text = dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+
+    body.write_line( 'Report Period *%s* - *%s*' % ( period_start_text, period_end_text))
+    add_errors(body, 'NEW', alertlist)
+    add_errors(body, 'CONT', alertlist)
+    add_errors(body, 'ENDED', alertlist)
+
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject_line
+    msg['From'] = sender
+    msg['To'] = receivers
+    msg.attach( MIMEText(str(body), 'html') )
+    smtp_host = 'localhost'
+    s = smtplib.SMTP(smtp_host)
+    s.sendmail(sender, config['receivers'], msg.as_string())
+    s.quit()
+
+if __name__ == '__main__':
+    #init_logger()
+    parser = argparse.ArgumentParser(description='BSA Alert Manager')
+    parser.add_argument('-p', '--path', nargs=1, required=True, help='Config Path')
+    opts = parser.parse_args()
+    path = opts.path[0]
+    main(path)
+ 
