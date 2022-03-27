@@ -102,8 +102,8 @@ class serverlogCollect:
             self.runcommand.exec_cmd('ls')
         except SSHCommandExecError:
             return
-        global EMAIL_STR
         global VAR
+        global LOG
         resp = ' '
         if ',' in self.sdir:
             logs = self.sdir.split(',')
@@ -125,6 +125,7 @@ class serverlogCollect:
                 resp += '\t' + '"Count:"' + self.runcommand.exec_cmd(cmd)
             resp += '\n'
         if resp:
+            global EMAIL_STR
             EMAIL_STR += resp 
             with open('/opt/bsa/bin/log_analyser.log','w') as lg_file:
                 if ((len(str(resp).strip())) > 72):
